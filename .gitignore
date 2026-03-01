@@ -1,0 +1,13 @@
+# Compiled binaries
+proxy
+tiny/tiny
+tiny/cgi-bin/adder
+
+# Object files
+*.o
+
+# Core dumps
+core
+
+# macOS
+.DS_Store
