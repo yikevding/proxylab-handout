@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include "csapp.h"
+#include <pthread.h>
+#include <time.h>
 
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
@@ -11,10 +13,11 @@ static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64;
 void doit(int fd);
 void parseuri(char *uri, char *hostname, char *port, char *path);
 void read_request_headers(rio_t *rio, char *extra_hdrs);
+void *thread_routine(void *vargp);
 
 int main(int argc, char **argv)
 {
-    int listenfd, connfd;
+    int listenfd;
     char hostname[MAXLINE], port[MAXLINE];
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
@@ -32,12 +35,14 @@ int main(int argc, char **argv)
     while (1)
     {
         clientlen = sizeof(clientaddr);
-        connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+        int *connfdp = Malloc(sizeof(int));
+        *connfdp = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+        pthread_t tid;
+        Pthread_create(&tid, NULL, thread_routine, connfdp);
+
+        // for logging purpose
         Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", hostname, port);
-
-        doit(connfd);
-        Close(connfd);
     }
     return 0;
 }
@@ -142,4 +147,24 @@ void parseuri(char *uri, char *hostname, char *port, char *path)
         strcpy(port, "80");
     }
     strcpy(hostname, hostptr);
+}
+
+void *thread_routine(void *vargp)
+{
+    int connfd = *((int *)vargp);
+    Free(vargp);
+    Pthread_detach(Pthread_self());
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    printf("[%.3f] Thread %ld: START\n", 0.0, pthread_self());
+
+    doit(connfd);
+    Close(connfd);
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("[%.3f] Thread %ld: END (%.3f sec)\n", elapsed, pthread_self(), elapsed);
+
+    return NULL;
 }
