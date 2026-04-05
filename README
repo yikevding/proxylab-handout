@@ -101,3 +101,250 @@ requests, follow these steps:
    [0.050] Thread 456: END (0.050 sec)
 
    Notice: Each thread completes before the next starts → sequential ✗
+
+####################################################################
+
+# Solution Overview
+
+####################################################################
+
+This proxy implementation covers all three parts of the lab:
+Part I (Basic), Part II (Concurrency), and Part III (Caching).
+
+## Request Flow: Client → Proxy → Server → Proxy → Client
+
+```
+1. CLIENT REQUEST
+   Browser: GET /home.html HTTP/1.0
+      ↓
+   Socket fd (connected to proxy)
+
+2. PROXY RECEIVES (thread_routine → doit function)
+   - Read HTTP request from client via fd
+   - Parse URI to extract hostname, port, path
+   - Check cache for hit (cache_read)
+
+   IF CACHE HIT:
+   - Send cached object directly to client
+   - Update LRU timestamp
+   - Return
+
+   IF CACHE MISS:
+   - Continue to step 3
+
+3. PROXY CONNECTS TO SERVER
+   - Open new socket (serverfd) to origin server
+   - Reconstruct HTTP request with:
+     * Forcefully use HTTP/1.0
+     * Add User-Agent header
+     * Add Connection: close
+     * Preserve client headers (except Host, User-Agent)
+
+4. PROXY SENDS REQUEST TO SERVER
+   Rio_writen(serverfd, request, length)
+
+5. PROXY RECEIVES RESPONSE FROM SERVER
+   - Read response in chunks via serverfd
+   - Forward chunks immediately to client via fd
+   - Buffer response in cache_buffer (if eligible)
+   - If response > MAX_OBJECT_SIZE, mark as ineligible for caching
+
+6. PROXY CACHES (Optional)
+   - If buffer didn't exceed MAX_OBJECT_SIZE
+   - Call cache_write to store in cache
+   - Uses LRU eviction if cache is full
+
+7. PROXY CLOSES CONNECTIONS
+   - Close serverfd (connection to origin server)
+   - fd closes automatically when thread ends
+```
+
+## Function Descriptions
+
+### Main Functions
+
+**main(int argc, char **argv)\*\*
+
+- Initializes the cache system (rwlock, blocks)
+- Listens for incoming client connections on the proxy port
+- For each connection: allocates fd, spawns new thread via thread_routine
+- Threads run detached (no memory leaks)
+- **Satisfies Part II**: Enables concurrent handling of multiple clients
+
+**thread_routine(void \*vargp)**
+
+- Entry point for each thread handling a client connection
+- Receives connfd (client socket) from main
+- Calls doit() to process the HTTP request
+- Prints timing information for concurrency verification
+- Detaches from main thread
+- **Satisfies Part II**: Each connection gets its own thread with independent execution
+
+**doit(int fd)**
+
+- Core proxy logic for handling a single HTTP request
+- Reads HTTP request headers from client (fd)
+- Parses URI to extract hostname, port, path
+- Checks cache before contacting server (cache_read)
+- Buffering: Accumulates server response in cache_buffer
+- Forwards response to client in real-time
+- Caches response if eligible (cache_write)
+- **Satisfies Part I**: Sequential HTTP processing pipeline
+- **Satisfies Part III**: Integration of cache_read and cache_write
+
+### URI and Header Handling
+
+**parseuri(char *uri, char *hostname, char *port, char *path)**
+
+- Parses absolute URI into components
+- Extracts hostname (e.g., "www.example.com")
+- Extracts port (defaults to 80 if not specified)
+- Extracts path (e.g., "/index.html")
+- Handles both absolute URIs and relative paths
+- **Satisfies Part I**: Correctly routes requests to proper servers
+
+**read_request_headers(rio_t *rio, char *extra_hdrs)**
+
+- Reads all HTTP headers from client after request line
+- Filters out headers that proxy will recreate (Host, User-Agent, Connection, Proxy-Connection)
+- Preserves other headers (cookies, etc.)
+- Stops at blank line (end of headers)
+- **Satisfies Part I**: Proper HTTP header handling
+
+### Cache Functions
+
+**cache_read(char \*url, int fd)**
+
+- Acquires READ lock (allows multiple simultaneous readers)
+- Searches all 10 cache blocks for matching URL
+- If found:
+  - Writes cached object directly to client via fd
+  - Updates LRU counter (marks as recently used)
+  - Returns 1 (cache hit)
+- If not found:
+  - Returns 0 (cache miss)
+- **Satisfies Part III**: Cache hit detection and serving
+- **Satisfies Part III**: Multiple threads can read cache simultaneously
+
+**cache_write(char *url, char *buffer, int size)**
+
+- Acquires WRITE lock (exclusive access, blocks all readers)
+- Finds first empty cache block
+- If all blocks occupied: evicts block with smallest LRU counter (Least Recently Used)
+- Stores:
+  - URL as cache key
+  - Response buffer as cached object
+  - Size of object
+  - Current timestamp as LRU counter
+- Updates global time counter for the next access
+- **Satisfies Part III**: LRU eviction policy
+- **Satisfies Part III**: Thread-safe writing with exclusive locks
+
+### Data Structures
+
+**cache_block**
+
+```
+- cache_object[MAX_OBJECT_SIZE]: Actual cached web object (100 KB max)
+- cache_key_url[MAXLINE]: URL used as lookup key
+- content_size: Actual size of cached object
+- lru_counter: Timestamp marking last access (for LRU eviction)
+- is_valid: Flag indicating if block contains valid data
+```
+
+**proxy_cache**
+
+```
+- blocks[MAX_CACHE_BLOCKS]: Array of 10 cache blocks
+  (10 × 100 KB = 1 MB, within MAX_CACHE_SIZE limit)
+- current_time: Global timestamp counter (incremented on each access)
+- rwlock: Readers-writers lock for thread-safe access
+```
+
+## How This Solution Satisfies Each Part
+
+### Part I: Basic Proxy (Sequential)
+
+✅ **Implemented by**: doit(), parseuri(), read_request_headers()
+
+- Reads HTTP request from client
+- Parses URI to find origin server
+- Connects to server and forwards request
+- Receives response and forwards to client
+- Properly handles multiple file types (binary-safe)
+
+### Part II: Concurrent Proxy (Threaded)
+
+✅ **Implemented by**: main(), thread_routine(), Pthread_create(), Pthread_detach()
+
+- Main loop uses Open_listenfd() to listen on proxy port
+- For each client connection, spawns new thread via Pthread_create()
+- Each thread runs independently in thread_routine()
+- Thread detaches itself with Pthread_detach() → no memory leaks
+- Multiple threads process requests concurrently
+- Thread-safe I/O functions: Open_clientfd(), Open_listenfd() use getaddrinfo()
+
+**Verification**: Run test_concurrent.sh and observe:
+
+- Multiple [ACCEPT] messages interspersed with [START/END] messages
+- Multiple thread IDs active before others complete
+- Not sequential: proof of concurrent execution
+
+### Part III: Caching
+
+✅ **Implemented by**: cache_read(), cache_write(), cache_block, proxy_cache
+
+**LRU Eviction Policy**:
+
+- Uses global timer (cache.current_time)
+- On each object access: updates its lru_counter with current timestamp
+- On cache full: evicts block with smallest (oldest) lru_counter
+- Approximates true LRU without expensive list operations
+
+**Size Limits**:
+
+- MAX_OBJECT_SIZE: Not cached if > 100 KB (checked during buffering)
+- MAX_CACHE_SIZE: Fixed 10 blocks × 100 KB = 1 MB (implicit enforcement)
+
+**Synchronization**:
+
+- Readers-Writers Lock (pthread_rwlock_t):
+  - cache_read() uses READ lock → multiple threads can read simultaneously
+  - cache_write() uses WRITE lock → exclusive access during insertion
+  - Avoids bottleneck: readers don't block each other
+- Atomic operations: \_\_sync_add_and_fetch() for thread-safe LRU updates
+
+**Verification**:
+
+- Compare HTTP request times:
+  - Cache miss: ~0.03-0.06s (server round trip)
+  - Cache hit: ~0.001-0.002s (memory only)
+  - Speedup: ~30-50x faster for cache hits
+- Verify data integrity: MD5 hashes of cached files match original
+
+## Design Choices & Rationale
+
+1. **Fixed-size cache array (10 blocks)**
+   - Simpler than dynamic allocation
+   - Ensures predictable total size: 10 × 100KB = 1 MB < 1049 KB limit
+   - LRU eviction handles replacement
+
+2. **Readers-Writers Lock**
+   - Single mutex would serialize all threads (defeats concurrency)
+   - RW lock allows multiple readers (cache hits) to run in parallel
+   - Only writes (cache insertion) need exclusive access
+
+3. **Buffering entire response**
+   - Simplest way to know if object is cacheable (need full size)
+   - Avoids fragmentation issues
+   - Per-connection buffer (MAX_OBJECT_SIZE per thread) is acceptable
+
+4. **Global timestamp counter for LRU**
+   - Simpler than maintaining linked list
+   - O(10) search instead of O(n)
+   - Atomic operations ensure thread safety
+
+5. **Parsing and reconstruction of requests**
+   - Normalizes HTTP/1.1 requests to HTTP/1.0
+   - Ensures proper User-Agent string
+   - Prevents proxy from crashing on Connection: keep-alive
